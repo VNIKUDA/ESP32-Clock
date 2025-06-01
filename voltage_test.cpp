@@ -704,11 +704,10 @@ void loop()
 {
     leftOled.clearDisplay();
     leftOled.setCursor(0, 0);
-    float voltage = map(analogRead(4), 0, 4095, 15, 21) / 10.0;
-    int charge = map(voltage * 10, 15, 21, 0, 100);
 
-    leftOled.printf("Voltage: %f\n", voltage * 2);
-    leftOled.printf("Charge: %i \% \n", charge);
+    float voltage = ((analogRead(4) / 4095.0) * 3.3) - 0.3;
+
+    leftOled.printf("Voltage: %f\n", voltage);
     leftOled.display();
     delay(1000);
 }
