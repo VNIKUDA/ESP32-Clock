@@ -24,6 +24,7 @@
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_BMP280.h>
 #include <Wire.h>
+#include <esp_pm.h>
 
 // Змінні для відстеження зміни часу
 long currentTime, previousTime;
@@ -32,19 +33,29 @@ long currentTime, previousTime;
 #define MILLI_TO_SECOND 1000.0
 #define MICRO_TO_SECOND 1000000.0
 
+// Через те що 
+#define TIME_OFFSET 1.00218167625
+
+// Заряд батареї та її напруга (приблизна)
+float voltage = 0;
+int charge = 0;
+
+#define DISCHARGED_BATTERY_VOLTAGE 3.3
+#define CHARGED_BATTERY_VOLTAGE 4.1
+
 // Режим (годинник + будильник, вибір налаштування, меню налаштування)
 int mode;
 
 // Налаштування будильника
 bool alarm_on = true;
 bool alarm_playing = false;
-int alarm_hours = 12, alarm_minutes = 0, alarm_seconds = 5;
+int alarm_hours = 7, alarm_minutes = 30, alarm_seconds = 0;
 
 // Налаштування поточного часу годинника
 float hours = 12, minutes = 0, seconds = 0;
 
 // Налаштування поточної дати
-int date = 20, month = 4, year = 2025;
+int date = 6, month = 6, year = 2025;
 
 // Список днів в кожному місяці (для лютого йде перевірка в коді)
 int monthDays[] = {
@@ -64,20 +75,22 @@ int monthDays[] = {
 
 // Список налаштувань та дій для меню вибору налаштування
 String options[] = {
-    "Alarm Time", "Alarm Status", "Date", "Time", "Exit"};
-int menu_option = 4; // Поточний вибір
+    "Battery", "Alarm Time", "Alarm Status", "Date", "Time", "Exit"};
+int options_count = sizeof(options) / sizeof(String);
+int menu_option = options_count - 1; // Поточний вибір
+int option_cursor = options_count - 1; // Індекс найвищої опції на екрані
 
 // Список полів для кожного меню налаштування
 float *timeFields[] = {&hours, &minutes, &seconds};
 int *dateFields[] = {&date, &month, &year};
 int *alarmFields[] = {&alarm_hours, &alarm_minutes, &alarm_seconds};
 
-int fieldCount[] = {3, 1, 3, 3}; // Кількість полів на кожному меню налаштування
+int fieldCount[] = {0, 3, 1, 3, 3}; // Кількість полів на кожному меню налаштування
 int current_field = 0;           // Поточне поле налаштування
 
 // Поріг зарахування натиску кнопки на певну дію
-#define MENU_ACTIVATION_THRESHOLD 1000 // Час для викликання SET MENU та підтвердження вибору\налаштувань
-#define ACTION_THRESHOLD 60            // Час для зарахування натиску кнопки
+#define MENU_ACTIVATION_THRESHOLD 500 // Час для викликання SET MENU та підтвердження вибору\налаштувань
+#define ACTION_THRESHOLD 20           // Час для зарахування натиску кнопки
 
 // Клас кнопки (для легшості роботи з ними та зменшеню повторення коду)
 class Button
@@ -208,6 +221,7 @@ Button setButton(1);
 Button downButton(2);
 
 #define PIEZO 3 // Цифровий порт для пієзодинаміка
+#define CHARGE_LED 21
 
 // Функція для відмальовки вертикальної стрілки
 void drawVArrow(int x, int y, int w, int h, int thickness, int direction, Adafruit_SSD1306 *display, int color = WHITE)
@@ -225,6 +239,37 @@ void drawVArrow(int x, int y, int w, int h, int thickness, int direction, Adafru
             display->drawLine(x + w / 2, y + h + i, x + w, y + i, color);
         }
     }
+}
+
+void drawRoundRect(int x, int y, int w, int h, int rounding, int direction, Adafruit_SSD1306 *display, int color = WHITE) {
+    if (direction == 1) {
+        display->drawCircleHelper(x + rounding, y + rounding, rounding, 1, color);
+        display->drawCircleHelper(x + rounding, y + h - rounding, rounding, 8, color);
+        display->drawFastHLine(x + rounding, y, w - rounding, color);
+        display->drawFastHLine(x + rounding, y + h, w - rounding, color);
+        display->drawFastVLine(x, y + rounding, h - rounding * 2 + 1, color);
+        display->drawFastVLine(x + w, y, h, color);
+    } else {
+        display->drawCircleHelper(x + w - rounding, y + rounding, rounding, 2, color);
+        display->drawCircleHelper(x + w - rounding, y + h - rounding, rounding, 4, color);
+        display->drawFastHLine(x, y, w - rounding + 1, color);
+        display->drawFastHLine(x, y + h, w - rounding + 1, color);
+        display->drawFastVLine(x + w, y + rounding, h - rounding * 2 + 1, color);
+        display->drawFastVLine(x, y, h, color);
+    }
+}
+
+void drawPattern(int x, int y, int w, int h, int lines, Adafruit_SSD1306 *display, int color = WHITE) {
+    int stepX = w / lines;
+    int stepY = h / lines;
+    for (int i = 1; i <= lines; i++) {
+        display->drawLine(x + 2, y + stepY * i + 2, x + stepX * i + 2, y + 2, color);
+        display->drawLine(x + w - 2, y + h - stepY * i - 2, x + w - stepX * i - 2, y + h - 2, color);
+    }
+}
+
+int clamp(int value, int maximum, int minimum) {
+    return max(min(maximum, value), minimum);
 }
 
 // ЕКРАН ГОДИННИКА
@@ -273,14 +318,14 @@ void clockUpdate()
     // Якщо кнопка меню затиснута, то перейти на екран меню
     if (setButton.getHold() && setButton.getPressedTime() >= MENU_ACTIVATION_THRESHOLD)
     {
-        menu_option = 4;
+        menu_option = options_count - 1;
         mode = 1;
         setButton.reset();
     }
 
     // Розрахунок скільки секунд пройшло з минулого оновлення
     float deltaTime = currentTime - previousTime;
-    seconds += deltaTime / MILLI_TO_SECOND;
+    seconds += (deltaTime / MILLI_TO_SECOND) * TIME_OFFSET;
 
     // Оновлення даних годиника
     timeUpdate();
@@ -323,6 +368,10 @@ void displayClock()
             leftOled.print((minutes < 10) ? '0' + String((int)minutes) : String((int)minutes));
         }
 
+        // leftOled.setTextSize(1);
+        // leftOled.setCursor(56, 56);
+        // leftOled.print((seconds < 10) ? '0' + String((int)seconds) : String((int)seconds));
+
         rightOled.setCursor(7, 8);
         rightOled.print((date < 10) ? '0' + String(date) : String(date));
         rightOled.print(".");
@@ -332,8 +381,10 @@ void displayClock()
 
         rightOled.drawFastHLine(0, 31, 128, WHITE);
 
-        rightOled.setCursor(33, 41);
-        rightOled.print(String(bmp.readTemperature()));
+        String temperature = String(bmp.readTemperature());
+        temperature.remove(temperature.length() - 1);
+        rightOled.setCursor(31, 41);
+        rightOled.print(temperature);
         rightOled.print("C");
     }
     else
@@ -360,12 +411,16 @@ void displayClock()
 void menuUpdate()
 {
     // Піднятися вверх по списку дій
-    if (upButton.getClicked() && menu_option < 4)
+    if (upButton.getClicked() && menu_option < options_count - 1) {
         menu_option++;
+        if (menu_option > option_cursor) option_cursor++;
+    }
 
     // Спуститися вниз по списку дій
-    if (downButton.getClicked() && menu_option > 0)
+    if (downButton.getClicked() && menu_option > 0) {
         menu_option--;
+        if (menu_option <= option_cursor - 4) option_cursor--;
+    }
 
     // Якщо кнопка затиснута (тобто користувач підтвердив вибір)
     if (setButton.getHold() && setButton.getPressedTime() >= MENU_ACTIVATION_THRESHOLD)
@@ -374,7 +429,7 @@ void menuUpdate()
         setButton.reset();
 
         // Якщо вибір був вийти, топ повертаємось на годинник
-        if (menu_option == 4)
+        if (menu_option == 5)
         {
             mode = 0;
         }
@@ -423,13 +478,22 @@ void displayMenu()
     leftOled.print("SET MENU");
     leftOled.drawRect(4, 52, 120, 2, WHITE);
 
-    for (int option = 4; option >= 0; option--)
+    // if (option_cursor == options_count - 1) {
+    //     rightOled.drawFastHLine(0, 1, 128, WHITE);
+    // }
+    // if (option_cursor == 3) {
+    //     rightOled.drawFastHLine(0, 63, 128, WHITE);
+    // }
+
+    for (int option = options_count - 1; option >= 0; option--)
     {
-        rightOled.setCursor(12, 5 + 8 * (4 - option) + 4 * (4 - option));
-        rightOled.print(options[option]);
+        if (option > option_cursor - 4 and option <= option_cursor) {
+            rightOled.setCursor(12, 8 + 14 * (options_count - 1 - option - (options_count - 1 - option_cursor)));
+            rightOled.print(options[option]);
+        }
     }
 
-    rightOled.drawRect(5, 2 + 8 * (4 - menu_option) + 4 * (4 - menu_option), 104, 12, WHITE);
+    rightOled.drawRect(5, 5 + 14 * (options_count - 1 - menu_option - (options_count - 1 - option_cursor)), 104, 13, WHITE);
 }
 
 // ЕКРАН НАЛАШТУВАННЯ
@@ -542,7 +606,7 @@ void displayActionMenu()
 {
     switch (menu_option)
     {
-    case 3:
+    case 4:
         leftOled.setTextSize(2);
         rightOled.setTextSize(2);
 
@@ -563,7 +627,7 @@ void displayActionMenu()
 
         break;
 
-    case 2:
+    case 3:
         leftOled.setTextSize(2);
         rightOled.setTextSize(2);
 
@@ -597,7 +661,7 @@ void displayActionMenu()
 
         break;
 
-    case 1:
+    case 2:
         leftOled.setTextSize(2);
         rightOled.setTextSize(2);
 
@@ -629,7 +693,7 @@ void displayActionMenu()
         rightOled.setTextColor(WHITE);
         break;
 
-    case 0:
+    case 1:
         leftOled.setTextSize(2);
         rightOled.setTextSize(2);
 
@@ -649,6 +713,38 @@ void displayActionMenu()
         drawVArrow(19 + 36.3 * current_field, 45, 13, 8, 3, -1, &rightOled);
 
         break;
+    case 0:
+        leftOled.setTextSize(2);
+        rightOled.setTextSize(2);
+
+        leftOled.drawRect(4, 12, 120, 2, WHITE);
+        leftOled.setCursor(21, 26);
+        leftOled.print("BATTERY");
+        leftOled.drawRect(4, 52, 120, 2, WHITE);
+
+        String buffer = "100%";
+        if (charge < 100 and charge >= 10) {
+            buffer[0] = ' '; buffer[1] = String(charge)[0]; buffer[2] = String(charge)[1];
+        } else if (charge < 10) {
+            buffer[0] = ' '; buffer[1] = ' '; buffer[2] = String(charge)[1];
+        }
+
+        rightOled.setCursor(40, 9);
+        rightOled.print(buffer);
+
+        drawRoundRect(30, 33, 14, 22, 5, 1, &rightOled);
+        if (charge > 5) drawPattern(30, 33, 14, 22, 4, &rightOled);
+        
+        rightOled.drawRect(48, 33, 14, 22, WHITE);
+        if (charge > 25) drawPattern(48, 33, 14, 22, 4, &rightOled);
+
+        rightOled.drawRect(66, 33, 14, 22, WHITE);
+        if (charge > 50) drawPattern(66, 33, 14, 22, 4, &rightOled);
+
+        drawRoundRect(84, 33, 14, 22, 5, 0, &rightOled);
+        if (charge > 75) drawPattern(84, 33, 14, 22, 4, &rightOled);
+        
+        break;
     }
 }
 
@@ -657,9 +753,8 @@ void displayActionMenu()
 void setup()
 {
     esp_sleep_enable_timer_wakeup(0.2 * MICRO_TO_SECOND);
-    pinMode(LED_BUILTIN, INPUT);
-    pinMode(21, OUTPUT);
-    digitalWrite(21, LOW);
+    pinMode(CHARGE_LED, OUTPUT);
+    digitalWrite(CHARGE_LED, LOW);
 
     pinMode(PIEZO, OUTPUT);
 
@@ -736,6 +831,21 @@ void loop()
 
     leftOled.display();
     rightOled.display();
+
+    voltage = ((analogRead(4) / 4095.0) * 3.3) - 0.29;
+    voltage *= 2.02;
+
+    charge = round((voltage - DISCHARGED_BATTERY_VOLTAGE) / (CHARGED_BATTERY_VOLTAGE - DISCHARGED_BATTERY_VOLTAGE) * 100);
+    charge = clamp(charge, 100, 0);
+
+    if (charge < 1) {
+        esp_deep_sleep_start();
+    }
+    else if (charge < 7 && currentTime % 1000 < 500) {
+        analogWrite(CHARGE_LED, 80);
+    } else {
+        digitalWrite(CHARGE_LED, LOW);
+    }
 
     // Затримка перед наступною ітерацією програми
     esp_light_sleep_start();
